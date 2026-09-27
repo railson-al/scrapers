@@ -1,0 +1,21 @@
+[project]
+name = "scrapers"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Railson Almeida", email = "railsonalmeida.dev@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "camoufox>=0.4.11",
+    "playwright>=1.63.0",
+    "python-dotenv>=1.2.3",
+]
+
+[project.scripts]
+scrapers = "scrapers:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
