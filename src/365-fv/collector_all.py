@@ -1,4 +1,3 @@
-import argparse
 import asyncio
 import hashlib
 import itertools
@@ -1539,53 +1538,6 @@ async def get_league_cards(
     return []
 
 
-def match_league(
-    cards,
-    wanted: str,
-):
-    """
-    Casa o valor de --league com os cards.
-    Um número seleciona pela posição da
-    lista impressa (existem ligas com o
-    mesmo nome). Senão: igualdade exata tem
-    prioridade, depois trecho do nome (sem
-    diferenciar maiúsculas).
-    Retorna a lista de matches.
-    """
-
-    wanted = normalize_text(
-        wanted
-    )
-
-    if wanted.isdigit():
-
-        position = int(wanted)
-
-        if 1 <= position <= len(cards):
-            return [
-                cards[position - 1]
-            ]
-
-        return []
-
-    wanted = wanted.lower()
-
-    exact = [
-        card
-        for card in cards
-        if card["name"].lower() == wanted
-    ]
-
-    if exact:
-        return exact
-
-    return [
-        card
-        for card in cards
-        if wanted in card["name"].lower()
-    ]
-
-
 def print_league_cards(
     cards,
 ):
@@ -1652,71 +1604,6 @@ async def activate_league_card(
     )
 
     return True
-
-
-async def select_league(
-    page,
-    wanted: str | None,
-):
-    """
-    Seleciona a liga pedida.
-    Sem --league, mantém a liga ativa.
-    Retorna (posição 1-based, cards) ou
-    (None, cards) em caso de erro.
-    """
-
-    cards = await get_league_cards(
-        page
-    )
-
-    print_league_cards(
-        cards
-    )
-
-    if not cards:
-        print(
-            "\nERRO: nenhum card de liga "
-            "encontrado."
-        )
-
-        return None, cards
-
-    if wanted is None:
-
-        active = [
-            card
-            for card in cards
-            if card["active"]
-        ]
-
-        if not active:
-            print(
-                "\nERRO: liga ativa "
-                "não identificada."
-            )
-
-            return None, cards
-
-        return cards.index(active[0]) + 1, cards
-
-    matches = match_league(
-        cards,
-        wanted,
-    )
-
-    if len(matches) != 1:
-
-        print(
-            f"\nERRO: --league '{wanted}' "
-            f"casou com {len(matches)} ligas. "
-            "Use o número [N] da lista acima "
-            "ou um trecho que identifique "
-            "apenas uma liga."
-        )
-
-        return None, cards
-
-    return cards.index(matches[0]) + 1, cards
 
 
 # ============================================================
@@ -2054,30 +1941,7 @@ def attach_coupon_files(
 # MAIN
 # ============================================================
 
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description=(
-            "Coleta todos os jogos (horários) "
-            "de uma liga de Futebol Virtual. "
-            "Para todas as ligas, use collector_all.py."
-        ),
-    )
-
-    parser.add_argument(
-        "--league",
-        help=(
-            "Nome ou trecho do nome da liga "
-            "(ex.: 'Premier', 'Euro Cup'). "
-            "Padrão: liga ativa ao abrir Futebol."
-        ),
-    )
-
-    return parser.parse_args()
-
-
 async def main():
-
-    args = parse_args()
 
     run_id = (
         datetime.now()
@@ -2129,8 +1993,8 @@ async def main():
         "target":
             "football",
 
-        "league_requested":
-            args.league,
+        "leagues":
+            [],
     }
 
     run_file = (
@@ -2330,12 +2194,22 @@ async def main():
             return
 
         # ====================================================
-        # LIGA
+        # LIGAS
         # ====================================================
 
-        position, cards = await select_league(
-            page=page,
-            wanted=args.league,
+        cards = await get_league_cards(
+            page
+        )
+
+        print_league_cards(
+            cards
+        )
+
+        positions = list(
+            range(
+                1,
+                len(cards) + 1,
+            )
         )
 
         run_metadata["available_leagues"] = [
@@ -2343,83 +2217,73 @@ async def main():
             for card in cards
         ]
 
-        if position is None:
-            return
-
-        card = cards[position - 1]
-
-        league_name = card["name"]
-
-        run_metadata["league"] = league_name
-
-        run_metadata["league_position"] = position
-
-        if not await activate_league_card(
-            page,
-            card,
-        ):
+        if not positions:
             return
 
         # ====================================================
         # COLETA
         # ====================================================
 
-        print(
-            "\n"
-            + "=" * 100
-        )
+        for position in positions:
 
-        print(
-            "COLETA DOS HORÁRIOS:",
-            league_name,
-        )
+            # Reconsulta os cards: a interface
+            # rerenderiza ao trocar de liga.
+            cards = await get_league_cards(
+                page
+            )
 
-        print(
-            "=" * 100
-        )
+            league = {
+                "position": position,
+                "name": None,
+                "league_id": None,
+                "time_slots": [],
+            }
 
-        slots = await collect_time_slots(
-            page=page,
-            collector=collector,
-        )
+            run_metadata["leagues"].append(
+                league
+            )
+
+            if position > len(cards):
+
+                league["error"] = "card not found"
+
+                continue
+
+            card = cards[position - 1]
+
+            league["name"] = card["name"]
+
+            print(
+                "\n"
+                + "=" * 100
+            )
+
+            print(
+                f"COLETA DOS HORÁRIOS [{position}/{len(cards)}]:",
+                card["name"],
+            )
+
+            print(
+                "=" * 100
+            )
+
+            if not await activate_league_card(
+                page,
+                card,
+            ):
+                league["error"] = "select failed"
+
+                continue
+
+            league["time_slots"] = await collect_time_slots(
+                page=page,
+                collector=collector,
+            )
 
         # Dá tempo aos handlers de response
         # terminarem de gravar os arquivos.
         await page.wait_for_timeout(
             2000
-        )
-
-    attach_coupon_files(
-        slots,
-        collector.coupons,
-    )
-
-    # ID real da liga (campo C do PD),
-    # pois há ligas com o mesmo nome.
-    run_metadata["league_id"] = next(
-        (
-            slot["league_id"]
-            for slot in slots
-            if slot["league_id"]
-        ),
-        None,
-    )
-
-    run_metadata["time_slots"] = slots
-
-    # Coupons sem horário correspondente
-    # (em geral, os de transição: stale=true),
-    # que podem duplicar jogos de outra liga.
-    linked_files = {
-        slot["file"]
-        for slot in slots
-        if slot.get("file")
-    }
-
-    for coupon in collector.coupons:
-        coupon["linked"] = (
-            coupon["file"]
-            in linked_files
         )
 
     run_metadata["coupons"] = collector.coupons
@@ -2430,28 +2294,80 @@ async def main():
     )
 
     print(
-        "RESUMO:",
-        league_name,
-        f"(C={run_metadata['league_id']})",
+        "RESUMO"
     )
 
-    for slot in slots:
+    for league in run_metadata["leagues"]:
+
+        slots = league["time_slots"]
+
+        attach_coupon_files(
+            slots,
+            collector.coupons,
+        )
+
+        # ID real da liga (campo C do PD),
+        # pois há ligas com o mesmo nome.
+        league["league_id"] = next(
+            (
+                slot["league_id"]
+                for slot in slots
+                if slot["league_id"]
+            ),
+            None,
+        )
+
+        filled = sum(
+            1
+            for slot in slots
+            if slot.get("file")
+            and not slot.get("empty")
+        )
+
         print(
-            f"  {slot['time']} "
-            f"E={slot['challenge_id']} "
-            f"file={slot.get('file')} "
-            f"size={slot.get('body_size')} "
-            f"empty={slot.get('empty')}"
+            f"\n[{league['position']}] {league['name']} "
+            f"(C={league['league_id']}) "
+            f"jogos com dados: {filled}/{len(slots)}"
             + (
-                " HORÁRIO DIVERGENTE"
-                if slot.get("start_matches") is False
+                f" erro={league['error']}"
+                if league.get("error")
                 else ""
             )
-            + (
-                f" erro={slot['error']}"
-                if slot.get("error")
-                else ""
+        )
+
+        for slot in slots:
+            print(
+                f"  {slot['time']} "
+                f"E={slot['challenge_id']} "
+                f"file={slot.get('file')} "
+                f"size={slot.get('body_size')} "
+                f"empty={slot.get('empty')}"
+                + (
+                    " HORÁRIO DIVERGENTE"
+                    if slot.get("start_matches") is False
+                    else ""
+                )
+                + (
+                    f" erro={slot['error']}"
+                    if slot.get("error")
+                    else ""
+                )
             )
+
+    # Coupons sem horário correspondente
+    # (em geral, os de transição: stale=true),
+    # que podem duplicar jogos de outra liga.
+    linked_files = {
+        slot["file"]
+        for league in run_metadata["leagues"]
+        for slot in league["time_slots"]
+        if slot.get("file")
+    }
+
+    for coupon in collector.coupons:
+        coupon["linked"] = (
+            coupon["file"]
+            in linked_files
         )
 
     unlinked = [
