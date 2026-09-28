@@ -1,119 +1,27 @@
 import asyncio
 import json
-import re
+import sys
 import time
 
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
 
 from camoufox.async_api import AsyncCamoufox
 
-
-# ============================================================
-# CONFIG
-# ============================================================
-
-BASE_URL = "https://www.bet365.bet.br/"
-
-DATA_DIR = Path("data")
-
-DIAGNOSTICS_DIR = (
-    DATA_DIR
-    / "diagnostics"
+# Permite importar config/utils da pasta pai (src/365-fv).
+sys.path.insert(
+    0,
+    str(Path(__file__).resolve().parent.parent),
 )
 
-
-# ============================================================
-# UTIL
-# ============================================================
-
-def now_iso():
-    return (
-        datetime.now()
-        .astimezone()
-        .isoformat()
-    )
-
-
-def normalize_text(
-    value: str | None,
-):
-    if not value:
-        return ""
-
-    return re.sub(
-        r"\s+",
-        " ",
-        value,
-    ).strip()
-
-
-def parse_url_query(
-    url: str,
-):
-    parsed = urlparse(
-        url
-    )
-
-    query = parse_qs(
-        parsed.query,
-        keep_blank_values=True,
-    )
-
-    result = {}
-
-    for key, values in query.items():
-
-        if len(values) == 1:
-            result[key] = values[0]
-
-        else:
-            result[key] = values
-
-    return result
-
-
-def is_interesting_url(
-    url: str,
-):
-    value = url.lower()
-
-    return (
-        "virtualsportscontentapi"
-        in value
-
-        or
-
-        "/contentdata/"
-        in value
-    )
-
-
-def classify_url(
-    url: str,
-):
-    value = url.lower()
-
-    if (
-        "/virtualsportscontentapi/splash"
-        in value
-    ):
-        return "splash"
-
-    if (
-        "/virtualsportscontentapi/coupon"
-        in value
-    ):
-        return "coupon"
-
-    if (
-        "/contentdata/"
-        in value
-    ):
-        return "contentdata"
-
-    return "other"
+from config import BASE_URL, DIAGNOSTICS_DIR
+from utils import (
+    now_iso,
+    parse_url_query,
+    normalize_text,
+    is_interesting_url,
+    classify_url,
+)
 
 
 # ============================================================

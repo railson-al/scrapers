@@ -34,8 +34,12 @@ O navegador ([Camoufox](https://camoufox.com/), um Firefox anti-detecção contr
 │   │   ├── collector_all.py # 1. coleta bruta de todas as ligas
 │   │   ├── parser.py       # 2. tokeniza o protocolo e monta a hierarquia
 │   │   ├── normalizer.py   # 3. achata para eventos → mercados → seleções
-│   │   ├── test_leagues.py # diagnóstico: percorre as ligas e registra o tráfego
-│   │   └── test_times.py   # diagnóstico: percorre os horários e registra o tráfego
+│   │   ├── config.py       # constantes compartilhadas (URL, diretórios de data/)
+│   │   ├── utils.py        # helpers puros compartilhados (datas, pd, JSON, URLs)
+│   │   ├── navigation.py   # RawCollector + navegação no site, usados pelos coletores
+│   │   └── tests/
+│   │       ├── test_leagues.py # diagnóstico: percorre as ligas e registra o tráfego
+│   │       └── test_times.py   # diagnóstico: percorre os horários e registra o tráfego
 │   └── scrapers/           # pacote do entrypoint `scrapers` (ainda placeholder)
 └── data/                   # saídas (ignorado pelo git)
 ```
@@ -55,7 +59,7 @@ uv run camoufox fetch   # baixa o binário do navegador Camoufox
 
 ## Uso
 
-Rode todos os comandos a partir da **raiz do repositório**, porque os scripts gravam em `data/` usando caminho relativo. O diretório `365-fv` tem hífen e não pode ser importado como pacote, então os scripts são executados direto pelo caminho.
+Rode todos os comandos a partir da **raiz do repositório**, porque os scripts gravam em `data/` usando caminho relativo. O diretório `365-fv` tem hífen e não pode ser importado como pacote, então os scripts são executados direto pelo caminho e importam `config`, `utils` e `navigation` como módulos soltos da mesma pasta (os scripts em `tests/` adicionam a pasta pai ao `sys.path`).
 
 ### 1. Coleta
 
@@ -143,8 +147,8 @@ Exemplo (resumido):
 Servem para mapear a navegação e as requisições de rede. Os dois abrem o navegador, chegam em Futebol Virtual, clicam em cada item e registram as requisições e respostas disparadas por cada clique.
 
 ```bash
-uv run python src/365-fv/test_leagues.py   # clica em cada liga
-uv run python src/365-fv/test_times.py     # clica em cada horário da liga ativa (e na área de Resultados)
+uv run python src/365-fv/tests/test_leagues.py   # clica em cada liga
+uv run python src/365-fv/tests/test_times.py     # clica em cada horário da liga ativa (e na área de Resultados)
 ```
 
 Os resultados vão para `data/diagnostics/<run_id>/` (`leagues.json` e `times.json`, respectivamente).

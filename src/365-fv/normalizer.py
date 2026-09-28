@@ -1,19 +1,14 @@
 import argparse
-import json
 import re
 
 from pathlib import Path
 
-
-# ============================================================
-# CONFIG
-# ============================================================
-
-DATA_DIR = Path("data")
-
-PARSED_DIR = DATA_DIR / "parsed"
-
-NORMALIZED_DIR = DATA_DIR / "normalized"
+from config import PARSED_DIR, NORMALIZED_DIR
+from utils import (
+    load_json,
+    save_json,
+    find_latest_run,
+)
 
 
 # ============================================================
@@ -28,37 +23,6 @@ POSITIONAL_LABEL_GROUPS = {
     "Time -  Gols",
     "Time a Marcar",
 }
-
-
-# ============================================================
-# JSON
-# ============================================================
-
-def load_json(path: Path):
-    with path.open(
-        "r",
-        encoding="utf-8",
-    ) as file:
-        return json.load(file)
-
-
-def save_json(
-    path: Path,
-    data,
-):
-    path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    path.write_text(
-        json.dumps(
-            data,
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
 
 
 # ============================================================
@@ -1083,30 +1047,6 @@ def normalize_file(
 
 
 # ============================================================
-# LATEST RUN
-# ============================================================
-
-def find_latest_run():
-
-    if not PARSED_DIR.exists():
-        return None
-
-    runs = [
-        path
-        for path in PARSED_DIR.iterdir()
-        if path.is_dir()
-    ]
-
-    if not runs:
-        return None
-
-    return max(
-        runs,
-        key=lambda path: path.name,
-    )
-
-
-# ============================================================
 # RUN
 # ============================================================
 
@@ -1286,7 +1226,7 @@ def main():
 
     else:
 
-        run_dir = find_latest_run()
+        run_dir = find_latest_run(PARSED_DIR)
 
         if run_dir is None:
 

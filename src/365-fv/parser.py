@@ -1,123 +1,17 @@
 import argparse
-import json
 import re
 
 from datetime import datetime
 from fractions import Fraction
 from pathlib import Path
 
-
-# ============================================================
-# CONFIG
-# ============================================================
-
-DATA_DIR = Path("data")
-
-RAW_DIR = DATA_DIR / "raw"
-
-PARSED_DIR = DATA_DIR / "parsed"
-
-
-# ============================================================
-# UTILITÁRIOS
-# ============================================================
-
-def load_json(path: Path):
-    with path.open(
-        "r",
-        encoding="utf-8",
-    ) as file:
-        return json.load(file)
-
-
-def save_json(
-    path: Path,
-    data,
-):
-    path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    path.write_text(
-        json.dumps(
-            data,
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-
-
-# ============================================================
-# PD
-# ============================================================
-
-def parse_pd(pd: str | None):
-    """
-    Exemplo:
-
-    #AC#B146#C20940364#D1#E139214584#F2#
-
-    vira aproximadamente:
-
-    {
-        "AC": "",
-        "B": "146",
-        "C": "20940364",
-        "D": "1",
-        "E": "139214584",
-        "F": "2"
-    }
-
-    Ainda não atribuímos significado definitivo
-    para essas chaves.
-    """
-
-    if not pd:
-        return {}
-
-    parts = pd.split("#")
-
-    result = {}
-
-    for part in parts:
-
-        if not part:
-            continue
-
-        match = re.match(
-            r"^([A-Z]+)(.*)$",
-            part,
-        )
-
-        if not match:
-            continue
-
-        key = match.group(1)
-
-        value = match.group(2)
-
-        # Caso uma chave apareça repetida,
-        # preservamos tudo.
-        if key in result:
-
-            if not isinstance(
-                result[key],
-                list,
-            ):
-                result[key] = [
-                    result[key]
-                ]
-
-            result[key].append(
-                value
-            )
-
-        else:
-            result[key] = value
-
-    return result
+from config import RAW_DIR, PARSED_DIR
+from utils import (
+    parse_pd,
+    load_json,
+    save_json,
+    find_latest_run,
+)
 
 
 # ============================================================
@@ -869,29 +763,6 @@ def parse_file(
 
 
 # ============================================================
-# ÚLTIMA EXECUÇÃO
-# ============================================================
-
-def find_latest_run():
-    if not RAW_DIR.exists():
-        return None
-
-    runs = [
-        path
-        for path in RAW_DIR.iterdir()
-        if path.is_dir()
-    ]
-
-    if not runs:
-        return None
-
-    return max(
-        runs,
-        key=lambda path: path.name,
-    )
-
-
-# ============================================================
 # PROCESSAMENTO DE RUN
 # ============================================================
 
@@ -1096,7 +967,7 @@ def main():
 
     else:
 
-        run_dir = find_latest_run()
+        run_dir = find_latest_run(RAW_DIR)
 
         if run_dir is None:
 
