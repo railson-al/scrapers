@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import json
 
@@ -16,6 +17,7 @@ from navigation import (
     print_league_cards,
     activate_league_card,
     collect_time_slots,
+    collect_results,
     attach_coupon_files,
 )
 
@@ -24,7 +26,26 @@ from navigation import (
 # MAIN
 # ============================================================
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Coleta todos os jogos de todas as "
+            "ligas de Futebol Virtual."
+        ),
+    )
+
+    parser.add_argument(
+        "--no-results",
+        action="store_true",
+        help="Não clica na aba Resultados de cada liga.",
+    )
+
+    return parser.parse_args()
+
+
 async def main():
+
+    args = parse_args()
 
     run_id = (
         datetime.now()
@@ -357,6 +378,16 @@ async def main():
                 league["error"] = "select failed"
 
                 continue
+
+            # Resultados antes dos horários: a aba
+            # mostra só 2 jogos por vez e a janela
+            # é curta; os jogos futuros continuam
+            # na faixa por vários minutos.
+            if not args.no_results:
+                league["results"] = await collect_results(
+                    page=page,
+                    collector=collector,
+                )
 
             league["time_slots"] = await collect_time_slots(
                 page=page,

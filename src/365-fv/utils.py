@@ -204,21 +204,35 @@ def find_latest_run(
 
 
 def detect_response_type(url: str):
-    url_lower = url.lower()
+    """
+    Tipo = nome do endpoint depois de /virtualsportscontentapi/
+    ("splash", "coupon", ...). Endpoints ainda não mapeados (ex.:
+    aba Resultados) também são capturados, com o próprio nome.
+    None = fora da API.
+    """
 
-    if (
-        "/virtualsportscontentapi/splash"
-        in url_lower
-    ):
-        return "splash"
+    parts = [
+        part
+        for part in urlparse(url).path.lower().split("/")
+        if part
+    ]
 
-    if (
-        "/virtualsportscontentapi/coupon"
-        in url_lower
-    ):
-        return "coupon"
+    if "virtualsportscontentapi" not in parts:
+        return None
 
-    return None
+    index = parts.index(
+        "virtualsportscontentapi"
+    )
+
+    if index + 1 >= len(parts):
+        return "other"
+
+    # Vira parte do nome do arquivo: só [a-z0-9_].
+    return re.sub(
+        r"[^a-z0-9]+",
+        "_",
+        parts[index + 1],
+    ).strip("_") or "other"
 
 
 def is_coupon_response(

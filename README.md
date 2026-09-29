@@ -79,6 +79,8 @@ uv run python src/365-fv/collector.py                     # liga ativa por padr�
 uv run python src/365-fv/collector.py --league "Euro Cup"  # trecho do nome
 uv run python src/365-fv/collector.py --league 7           # posição [N] na lista impressa
 uv run python src/365-fv/collector_all.py                  # todas as ligas, uma após a outra (~3 min)
+uv run python src/365-fv/collector.py --no-results         # pula a aba Resultados (vale para os dois)
+uv run python src/365-fv/collector.py --league 1 --watch 60 --click-delay 300  # sessão contínua, ver abaixo
 ```
 
 1. Abre `https://www.bet365.bet.br/` e procura o item **Esportes Virtuais**.
@@ -86,6 +88,9 @@ uv run python src/365-fv/collector_all.py                  # todas as ligas, uma
 3. Testa candidatos de clique para **Futebol** até disparar o splash `#AVR#B146` (Futebol Virtual).
 4. Lista os cards de liga (`div.vcm-d4`, o ativo tem `vcm-98c`) e seleciona a liga de `--league` (o `collector_all.py` percorre todas). Existem ligas com o mesmo nome (variantes com IDs `C` diferentes); nesse caso use o número `[N]`. As variantes `VR_NJ_*` do splash (hoje as posições 2, 3 e 7) têm horários no fuso dos EUA e sempre retornam coupons vazios no .bet.br.
 5. Descobre os horários da faixa ao lado de "Resultados" e clica em cada um, esperando o coupon daquele jogo antes do próximo clique. Cada coupon traz **um único jogo**, identificado pelo `E<ChallengeID>` do `pd`. O horário já exibido não dispara request; nele é usado o último coupon capturado.
+6. Clica na aba **Resultados** da liga (a menos que se passe `--no-results`). Ela chama `contentdata/virtualsportscontentapi/results` com `pd=#AVA#B146#C<league_id>#R^1#`, salvo como `NNNN_results.json`. Para diagnóstico, a etapa também grava XHRs do site fora da API (`NNNN_results_xhr.json`) e um snapshot do texto/HTML da tela (`NNNN_results_dom.json`). O resumo fica em `results` no `run.json` (em `leagues[]` no `collector_all.py`). Uma falha nessa etapa é registrada em `results.error` e não interrompe a coleta.
+
+**Ordem e modo contínuo (`collector.py`).** Os resultados são lidos **antes** dos horários, porque a aba mostra só 2 jogos por vez e a janela é curta. Com `--watch SEGUNDOS`, o navegador fica aberto na liga e o ciclo (Resultados + todos os horários) se repete a cada N segundos, sem refazer a navegação. Cada ciclo é uma run própria em `data/raw/`, já processada por parser → normalizer → loader, e imprime uma linha `[pipeline]` de resumo. `--click-delay MS` ajusta a espera entre os cliques nos horários (padrão: 1000). `--cycles N` limita o número de ciclos. Três ciclos seguidos sem nenhum coupon encerram o modo. A cada falha, a navegação é refeita a partir da home. A entrada em Esportes Virtuais aceita o menu lateral quando o bloco principal não aparece, e o bloco de futebol é aceito como "Futebol" ou "Football".
 
 Cada arquivo bruto contém a URL, os parâmetros de query (incluindo `pd`) e os headers relevantes. Os cookies ficam só como nomes e hash SHA-256. O corpo da resposta é salvo inteiro, com tamanho e SHA-256. O `run.json` registra o início e o fim da execução, as ligas disponíveis, a liga coletada (`league`, `league_position`, `league_id`) e seus `time_slots`: horário, `league_id`/`challenge_id`, arquivo e `start_matches` (o início do jogo no `CM` do coupon bate com o horário clicado). No `collector_all.py`, isso fica numa lista `leagues`, com um item por liga (`position`, `name`, `league_id`, `time_slots`). A lista `coupons` resume todos os coupons salvos:
 
@@ -100,7 +105,7 @@ uv run python src/365-fv/parser.py --run 20260927_113032
 uv run python src/365-fv/parser.py --file data/raw/20260927_113032/0003_coupon.json
 ```
 
-Processa apenas arquivos `*_coupon.json`. Etapas:
+Processa os arquivos `*_coupon.json` e `*_results.json`. Nos resultados, cada jogo encerrado é um `MG` com `N2`/`N3` (mandante/visitante), `SS` (placar `casa#fora`), `SM` (horário `H.MM`) e `NA` (liga), seguido dos `PA` com as seleções vencedoras. Eles saem em `results`, cada um com seus `fields`, `market` e `selections`. Nos coupons, as etapas são:
 
 - **Tokenização:** o corpo (`F|CL;...|EV;...|MG;...|MA;...|PA;...|`) vira uma lista de registros `{type, fields}`.
 - **Hierarquia:** `CL` (competição) → `EV` (evento) → `MG` (grupo de mercado) → `MA` (mercado) → `PA` (seleção).
@@ -124,6 +129,7 @@ Gera uma estrutura plana e pronta para banco de dados:
 - Resolve nomes e labels das seleções pelo ID. Nos grupos em que o label depende da posição (`Gols Mais/Menos`, `Resultado/Ambos Marcam`, `Margem de Vitória`, entre outros), usa os templates de posição definidos em `POSITIONAL_LABEL_GROUPS`.
 - Extrai o handicap e descarta registros auxiliares sem odd.
 - Cria uma `group_key` estável para grupos de mercado sem ID.
+- Nos `*_results.json`, gera um item por jogo: `league_id` (do `C` do `pd`), `result_time` (`SM` → `HH:MM`), times, `home_score`/`away_score` (NULL quando o `SS` vem vazio, `#`), placar do intervalo (de "Resultado Correto - Intervalo") e `winner` (`home`/`draw`/`away`, de "Resultado Final").
 
 Exemplo (resumido):
 
@@ -164,10 +170,13 @@ uv run python src/365-fv/loader.py --file data/normalized/20260927_113032/0003_c
 Grava em `data/db/bet365.sqlite`, usando o schema de `src/365-fv/schema.sql` (aplicado automaticamente a cada conexão):
 
 - `leagues` (`league_id`, `name`): o nome vem do `run.json` da captura crua, casado pelo nome do arquivo. Sem ele, o id sai do código `M` do `pd`.
-- `games`: um jogo por `fixture_id`, com mandante/visitante, `league_id`, `start_time`, `home_score`/`away_score` (NULL por enquanto, porque a coleta ainda não pega resultados) e a última `run_id`.
+- `games`: um jogo por `fixture_id`, com mandante/visitante, `league_id`, `start_time`, `home_score`/`away_score` (preenchidos pelos resultados, ver abaixo) e a última `run_id`.
 - `markets`: mercados do jogo, identificados por `(fixture_id, position)`. O `market_id` do protocolo identifica o grupo e se repete entre colunas como "Mais de"/"Menos de".
 - `selections`: seleções com `odds_fractional` e `odds_decimal`.
+- `results`: resultados da aba Resultados, inclusive os que ainda não casaram com um jogo (`fixture_id` NULL).
 - Views `games_view` (confronto, liga, data, hora, placar) e `odds_view` (odds achatadas com o jogo).
+
+**Resultados e placares.** O results não traz `fixture_id`, só `HH:MM`. A data é inferida pelo horário de referência da liga na mesma run (o menor `start_time` dos coupons dela): o jogo é o último `HH:MM` até essa referência, ou seja, o do dia anterior quando passa da meia-noite. Se existir o jogo do coupon com a mesma liga, os mesmos times e o mesmo `start_time` **exato**, o placar vai para ele. Senão, o resultado **cria o próprio jogo** em `games`, com `fixture_id` sintético (`res:<liga>|<início>|<mandante>|<visitante>`) e sem odds. Se o coupon real chegar depois, o resultado passa para ele e o jogo sintético é apagado. Isso roda a cada carga. Sem referência de data (liga sem nenhum coupon com dados na run), o resultado fica só na tabela `results`.
 
 A carga é idempotente: recarregar uma run atualiza o jogo e troca as odds pelo snapshot mais recente, sem apagar o placar.
 
@@ -197,7 +206,7 @@ Servem para mapear a navegação e as requisições de rede. Os dois abrem o nav
 
 ```bash
 uv run python src/365-fv/tests/test_leagues.py   # clica em cada liga
-uv run python src/365-fv/tests/test_times.py     # clica em cada horário da liga ativa (e na área de Resultados)
+uv run python src/365-fv/tests/test_times.py     # clica em cada horário da liga ativa
 ```
 
 Os resultados vão para `data/diagnostics/<run_id>/` (`leagues.json` e `times.json`, respectivamente).
@@ -206,6 +215,8 @@ Os resultados vão para `data/diagnostics/<run_id>/` (`leagues.json` e `times.js
 
 - A semântica de vários tokens (`pd`, campos de `EV`/`MA`/`PA`) ainda não foi confirmada.
 - `start_time` não tem timezone definido.
+- A aba Resultados mostra só 2 jogos por liga, de um cache do servidor que avança aos saltos e fica de minutos a ~2h30 atrás da faixa de horários (varia por liga). Os jogos entre um par e outro nunca aparecem.
+- Muitas sessões novas em pouco tempo fazem o site devolver coupons vazios (HTTP 200 sem corpo). Prefira `--watch`, que abre a página uma vez só.
 - A coleta pega uma liga por execução, sem agendamento nem loop contínuo.
 - Os seletores de DOM são heurísticos (pontuação de candidatos) e podem quebrar se o layout do site mudar.
-- O entrypoint `scrapers` (`src/scrapers`) ainda é um placeholder. `python-dotenv` está nas dependências, mas ainda não é usado.
+- `python-dotenv` está nas dependências, mas ainda não é usado.

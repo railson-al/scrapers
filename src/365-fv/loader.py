@@ -5,12 +5,16 @@ Lê data/normalized/<run_id>/*_coupon.json e grava games,
 markets e selections no banco (DB_PATH). A liga vem do
 run.json da captura crua, casada pelo nome do arquivo.
 
+Também lê os *_results.json (aba Resultados), grava a tabela
+results e aplica os placares nos jogos que casarem.
+
 Idempotente: rodar de novo a mesma run só atualiza os jogos
 e troca as odds pelo snapshot mais recente.
 """
 
 import argparse
 
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from config import RAW_DIR, NORMALIZED_DIR, DB_PATH
@@ -19,6 +23,8 @@ from database import (
     upsert_league,
     upsert_game,
     replace_markets,
+    upsert_result,
+    match_results,
 )
 from utils import (
     load_json,
@@ -60,7 +66,17 @@ def build_league_map(
 
     league_map = {}
 
-    for league in run.get("leagues") or []:
+    # collector.py grava uma liga só, com
+    # time_slots no topo do run.json.
+    leagues = run.get("leagues") or [
+        {
+            "name": run.get("league"),
+            "league_id": run.get("league_id"),
+            "time_slots": run.get("time_slots"),
+        }
+    ]
+
+    for league in leagues:
 
         for slot in league.get("time_slots") or []:
 
@@ -90,6 +106,112 @@ def league_from_pd(
     return value or None
 
 
+def coupon_league_id(
+    file_name: str,
+    source: dict,
+    league_map: dict,
+):
+    league_id, _ = league_map.get(
+        file_name,
+        (None, None),
+    )
+
+    return league_id or league_from_pd(
+        source.get("pd")
+    )
+
+
+# ============================================================
+# RESULTADOS: DATA DO JOGO
+# ============================================================
+
+def infer_start_time(
+    result_time: str | None,
+    reference: str | None,
+):
+    """
+    O results só traz HH:MM. A data sai de uma
+    referência no mesmo fuso: o jogo é o último
+    HH:MM até a referência (se passar dela, foi
+    no dia anterior).
+    """
+
+    if not result_time or not reference:
+        return None
+
+    hour, minute = (
+        int(part)
+        for part in result_time.split(":")
+    )
+
+    reference_dt = datetime.fromisoformat(
+        reference
+    )
+
+    candidate = reference_dt.replace(
+        hour=hour,
+        minute=minute,
+        second=0,
+        microsecond=0,
+    )
+
+    if candidate > reference_dt:
+        candidate -= timedelta(days=1)
+
+    return candidate.isoformat()
+
+
+def build_reference_times(
+    run_dir: Path,
+    league_map: dict,
+):
+    """
+    {league_id: menor start_time da liga na run}.
+
+    Os coupons da mesma run dão o "agora" de
+    cada liga no fuso do site (as ligas VR_NJ
+    usam outro fuso). Com league_map, só entram
+    coupons ligados a um horário: os de transição
+    (stale) podem ser de outra liga.
+    """
+
+    references = {}
+
+    for coupon_file in run_dir.glob(
+        "*_coupon.json"
+    ):
+
+        if league_map and coupon_file.name not in league_map:
+            continue
+
+        data = load_json(
+            coupon_file
+        )
+
+        league_id = coupon_league_id(
+            coupon_file.name,
+            data.get("source") or {},
+            league_map,
+        )
+
+        for event in data.get("events") or []:
+
+            start_time = event.get(
+                "start_time"
+            )
+
+            if not league_id or not start_time:
+                continue
+
+            if start_time < references.get(
+                league_id,
+                "9999",
+            ):
+                references[league_id] = start_time
+
+    return references
+
+
 # ============================================================
 # LOAD
 # ============================================================
@@ -109,15 +231,16 @@ def load_file(
 
     captured_at = source.get("captured_at") or ""
 
-    league_id, league_name = league_map.get(
+    _, league_name = league_map.get(
         input_file.name,
         (None, None),
     )
 
-    if league_id is None:
-        league_id = league_from_pd(
-            source.get("pd")
-        )
+    league_id = coupon_league_id(
+        input_file.name,
+        source,
+        league_map,
+    )
 
     game_count = 0
     market_count = 0
@@ -135,6 +258,21 @@ def load_file(
         for event in data.get("events") or []:
 
             if not event.get("fixture_id"):
+                continue
+
+            # Ex.: coupon que veio em inglês ("Fulltime
+            # Result"): o normalizer não acha os times.
+            # Pula o jogo em vez de abortar a run; ele
+            # volta numa coleta seguinte.
+            if not (
+                event.get("home_team")
+                and event.get("away_team")
+            ):
+                print(
+                    f"Aviso: {input_file.name} "
+                    f"fixture {event['fixture_id']} "
+                    "sem mandante/visitante, ignorado"
+                )
                 continue
 
             upsert_game(
@@ -164,6 +302,88 @@ def load_file(
     )
 
     return game_count
+
+
+def load_results_file(
+    conn,
+    input_file: Path,
+    references: dict,
+):
+    data = load_json(
+        input_file
+    )
+
+    source = data.get("source") or {}
+
+    league_id = source.get(
+        "league_id"
+    )
+
+    if not league_id:
+
+        print(
+            f"{input_file.name}: sem league_id no pd, ignorado"
+        )
+
+        return 0
+
+    run_id = input_file.parent.name
+
+    reference = references.get(
+        league_id
+    )
+
+    count = 0
+
+    with conn:
+
+        for result in data.get("results") or []:
+
+            if not (
+                result.get("result_time")
+                and result.get("home_team")
+                and result.get("away_team")
+            ):
+                continue
+
+            upsert_result(
+                conn,
+                result,
+                league_id=league_id,
+                start_time=infer_start_time(
+                    result["result_time"],
+                    reference,
+                ),
+                run_id=run_id,
+                captured_at=source.get("captured_at") or "",
+            )
+
+            count += 1
+
+    print(
+        f"{input_file.name}: "
+        f"{count} resultados | "
+        f"liga: {league_id} | "
+        f"referência: {reference or 'nenhuma (sem data, não casa)'}"
+    )
+
+    return count
+
+
+def apply_results(
+    conn,
+):
+    with conn:
+        applied = match_results(
+            conn
+        )
+
+    print(
+        "Placares aplicados:",
+        applied,
+    )
+
+    return applied
 
 
 def load_run(
@@ -215,6 +435,33 @@ def load_run(
             input_file,
             league_map,
         )
+
+    results_files = sorted(
+        run_dir.glob(
+            "*_results.json"
+        )
+    )
+
+    if results_files:
+
+        references = build_reference_times(
+            run_dir,
+            league_map,
+        )
+
+        for input_file in results_files:
+
+            load_results_file(
+                conn,
+                input_file,
+                references,
+            )
+
+    # Sempre: jogos novos podem casar com
+    # resultados de cargas anteriores.
+    apply_results(
+        conn
+    )
 
     print(
         "\n"
@@ -291,12 +538,31 @@ def main():
 
                 return
 
-            load_file(
-                conn,
-                input_file,
-                build_league_map(
-                    input_file.parent.name
-                ),
+            league_map = build_league_map(
+                input_file.parent.name
+            )
+
+            if input_file.name.endswith("_results.json"):
+
+                load_results_file(
+                    conn,
+                    input_file,
+                    build_reference_times(
+                        input_file.parent,
+                        league_map,
+                    ),
+                )
+
+            else:
+
+                load_file(
+                    conn,
+                    input_file,
+                    league_map,
+                )
+
+            apply_results(
+                conn
             )
 
             return

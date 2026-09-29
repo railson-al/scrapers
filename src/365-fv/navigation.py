@@ -9,8 +9,9 @@ import json
 import re
 
 from pathlib import Path
+from urllib.parse import urlparse
 
-from config import EMPTY_COUPON_MARKER
+from config import BASE_URL, EMPTY_COUPON_MARKER
 from utils import (
     now_iso,
     sha256_text,
@@ -20,6 +21,11 @@ from utils import (
     detect_response_type,
     is_coupon_response,
     extract_cookie_info,
+)
+
+
+FOOTBALL_LABEL = re.compile(
+    r"^\s*(Futebol|Football)\s*$"
 )
 
 
@@ -53,6 +59,17 @@ class RawCollector:
         # foi visto primeiro. Detecta coupons
         # de transição de liga (stale).
         self.league_by_challenge = {}
+
+        # Todo arquivo gravado, em ordem:
+        # {"sequence", "file", "type", "url"}.
+        # collect_results usa para saber o
+        # que chegou depois do clique.
+        self.saved = []
+
+        # Etapa atual da coleta ("results"
+        # durante collect_results), anotada
+        # nos coupons do run.json.
+        self.phase = None
 
     def is_stale(
         self,
@@ -178,11 +195,21 @@ class RawCollector:
     async def capture_response(
         self,
         response,
+        response_type=None,
     ):
+        """
+        response_type força o tipo (e o nome
+        do arquivo) para respostas de fora da
+        virtualsportscontentapi.
+        """
+
         url = response.url
 
-        response_type = detect_response_type(
-            url
+        response_type = (
+            response_type
+            or detect_response_type(
+                url
+            )
         )
 
         if not response_type:
@@ -366,6 +393,15 @@ class RawCollector:
             encoding="utf-8",
         )
 
+        self.saved.append(
+            {
+                "sequence": sequence,
+                "file": filename,
+                "type": response_type,
+                "url": url,
+            }
+        )
+
         empty = (
             not body
             or EMPTY_COUPON_MARKER in body
@@ -418,6 +454,7 @@ class RawCollector:
                     "body_size": len(body),
                     "empty": empty,
                     "stale": stale,
+                    "phase": self.phase,
                 }
             )
 
@@ -476,6 +513,53 @@ class RawCollector:
         )
 
 
+    def save_snapshot(
+        self,
+        label: str,
+        payload: dict,
+    ):
+        """
+        Grava um JSON que não é resposta de
+        rede (ex.: snapshot do DOM) na mesma
+        sequência NNNN_ dos demais arquivos.
+        """
+
+        sequence = next(
+            self.sequence
+        )
+
+        filename = (
+            f"{sequence:04d}_"
+            f"{label}.json"
+        )
+
+        (self.output_dir / filename).write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "sequence": sequence,
+                    "captured_at": now_iso(),
+                    "type": label,
+                    **payload,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        self.saved.append(
+            {
+                "sequence": sequence,
+                "file": filename,
+                "type": label,
+                "url": None,
+            }
+        )
+
+        return filename
+
+
 # ============================================================
 # ESPORTES VIRTUAIS
 # ============================================================
@@ -484,6 +568,7 @@ class RawCollector:
 async def find_virtual_sports_entry(
     page,
     timeout_seconds=30,
+    navigation_fallback_seconds=10,
 ):
     """
     Encontra "Esportes Virtuais" sem cair no strict mode.
@@ -492,6 +577,9 @@ async def find_virtual_sports_entry(
     1. elemento visível fora da navegação lateral
     2. DIV visível
     3. qualquer elemento visível
+    4. após navigation_fallback_seconds, o item
+       clicável do menu lateral (em alguns horários
+       a home não mostra o bloco principal, só o menu)
     """
 
     print(
@@ -503,8 +591,10 @@ async def find_virtual_sports_entry(
         asyncio.get_running_loop()
     )
 
+    started = loop.time()
+
     deadline = (
-        loop.time()
+        started
         + timeout_seconds
     )
 
@@ -739,6 +829,34 @@ async def find_virtual_sports_entry(
                     "element"
                 ]
 
+        # ====================================================
+        # PRIORIDADE 4
+        # Menu lateral, depois de dar tempo ao
+        # bloco principal de renderizar
+        # ====================================================
+
+        if (
+            loop.time() - started
+            >= navigation_fallback_seconds
+        ):
+
+            for item in candidates:
+
+                if item["cursor"] == "pointer":
+
+                    print(
+                        "\nSelecionado do menu lateral:"
+                    )
+
+                    print(
+                        f"tag={item['tag']} "
+                        f"class={item['class']}"
+                    )
+
+                    return item[
+                        "element"
+                    ]
+
         await page.wait_for_timeout(
             500
         )
@@ -964,10 +1082,12 @@ async def find_football_click_candidates(
         < deadline
     ):
 
+        # O bloco já apareceu como "Futebol" e como
+        # "Football" (site em inglês). Texto exato:
+        # não pega "Football Match Day".
         futebol = (
             page.get_by_text(
-                "Futebol",
-                exact=True,
+                FOOTBALL_LABEL,
             )
         )
 
@@ -1469,12 +1589,14 @@ async def activate_league_card(
 # ============================================================
 
 
-async def find_results_anchor(
+async def find_results_tab(
     page,
 ):
     """
-    O texto "Resultados" serve de âncora
-    geométrica para a linha de horários.
+    A aba "Resultados", à esquerda da
+    faixa de horários. Com vários textos
+    visíveis, pega o mais alto.
+    Retorna {"element", "box"} ou None.
     """
 
     main = await get_main(
@@ -1506,18 +1628,35 @@ async def find_results_anchor(
 
         if box:
             candidates.append(
-                box
+                {
+                    "element": element,
+                    "box": box,
+                }
             )
 
     if not candidates:
         return None
 
-    # Se existirem vários, pega o mais alto.
     candidates.sort(
-        key=lambda box: box["y"]
+        key=lambda item: item["box"]["y"]
     )
 
     return candidates[0]
+
+
+async def find_results_anchor(
+    page,
+):
+    """
+    O texto "Resultados" serve de âncora
+    geométrica para a linha de horários.
+    """
+
+    tab = await find_results_tab(
+        page
+    )
+
+    return tab["box"] if tab else None
 
 
 async def find_time_elements(
@@ -1641,6 +1780,7 @@ async def discover_time_slots(
 async def collect_time_slots(
     page,
     collector,
+    click_delay_ms=1000,
 ):
     """
     Clica em cada horário da liga ativa e
@@ -1744,10 +1884,197 @@ async def collect_time_slots(
         # Evita cliques em sequência rápida
         # demais, que cancelam requests.
         await page.wait_for_timeout(
-            1000
+            click_delay_ms
         )
 
     return results
+
+
+# ============================================================
+# RESULTADOS
+# ============================================================
+
+def is_site_xhr(
+    response,
+):
+    """
+    XHR/fetch do domínio do site que não
+    é da virtualsportscontentapi (essas o
+    handler principal já grava).
+    """
+
+    if response.request.resource_type not in (
+        "xhr",
+        "fetch",
+    ):
+        return False
+
+    if detect_response_type(
+        response.url
+    ):
+        return False
+
+    site = (
+        urlparse(BASE_URL).hostname or ""
+    ).removeprefix("www.")
+
+    host = urlparse(
+        response.url
+    ).hostname or ""
+
+    return host == site or host.endswith(
+        "." + site
+    )
+
+
+async def collect_results(
+    page,
+    collector,
+    settle_ms=5000,
+):
+    """
+    Clica na aba "Resultados" da liga ativa
+    e grava tudo o que ela carregar:
+    - respostas da virtualsportscontentapi
+      (pelo handler principal do collector);
+    - XHRs do site fora da API
+      (NNNN_results_xhr.json);
+    - snapshot do DOM (NNNN_results_dom.json),
+      caso o placar só exista na tela.
+
+    Fase de descoberta: o formato dos
+    resultados ainda não é conhecido. Nunca
+    levanta exceção, para não perder a
+    coleta dos coupons.
+    """
+
+    entry = {
+        "clicked": False,
+        "files": [],
+        "requests": [],
+    }
+
+    marker = len(
+        collector.saved
+    )
+
+    def on_request(
+        request,
+    ):
+        if request.resource_type in (
+            "xhr",
+            "fetch",
+        ):
+            entry["requests"].append(
+                {
+                    "method": request.method,
+                    "url": request.url,
+                }
+            )
+
+    async def on_response(
+        response,
+    ):
+        if is_site_xhr(
+            response
+        ):
+            await collector.capture_response(
+                response,
+                response_type="results_xhr",
+            )
+
+    collector.phase = "results"
+
+    page.on(
+        "request",
+        on_request,
+    )
+
+    page.on(
+        "response",
+        on_response,
+    )
+
+    try:
+
+        tab = await find_results_tab(
+            page
+        )
+
+        if tab is None:
+
+            print(
+                "\nAba 'Resultados' não encontrada."
+            )
+
+            entry["error"] = "tab not found"
+
+            return entry
+
+        print(
+            "\nClicando em 'Resultados'..."
+        )
+
+        await tab["element"].click(
+            timeout=5_000,
+        )
+
+        entry["clicked"] = True
+
+        # Sem saber qual request esperar,
+        # dá um tempo fixo para a rede e a
+        # tela assentarem.
+        await page.wait_for_timeout(
+            settle_ms
+        )
+
+        main = await get_main(
+            page
+        )
+
+        entry["dom_file"] = collector.save_snapshot(
+            "results_dom",
+            {
+                "url": page.url,
+                "text": await main.inner_text(),
+                "html": await main.inner_html(),
+            },
+        )
+
+    except Exception as exc:
+
+        print(
+            "\nERRO coletando resultados:",
+            exc,
+        )
+
+        entry["error"] = str(exc)
+
+    finally:
+
+        page.remove_listener(
+            "request",
+            on_request,
+        )
+
+        page.remove_listener(
+            "response",
+            on_response,
+        )
+
+        collector.phase = None
+
+        entry["files"] = [
+            item["file"]
+            for item in collector.saved[marker:]
+        ]
+
+    print(
+        "Arquivos de resultados:",
+        entry["files"],
+    )
+
+    return entry
 
 
 def attach_coupon_files(

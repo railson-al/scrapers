@@ -101,6 +101,54 @@ CREATE TABLE IF NOT EXISTS selections (
 
 
 -- ============================================================
+-- RESULTADOS (aba Resultados)
+-- ============================================================
+--
+-- O results não traz fixture_id: o jogo é casado por liga +
+-- times + start_time (inferido do horário SM). Sem jogo do
+-- coupon, o resultado cria o próprio jogo (fixture_id
+-- "res:" + result_key), trocado pelo real se ele chegar
+-- depois. Sem start_time, fica só aqui (fixture_id NULL).
+-- Ver database.match_results.
+
+CREATE TABLE IF NOT EXISTS results (
+    -- league_id|start_time (ou HH:MM)|mandante|visitante
+    result_key     TEXT PRIMARY KEY,
+
+    league_id      TEXT NOT NULL,
+    home_team      TEXT NOT NULL,
+    away_team      TEXT NOT NULL,
+
+    -- HH:MM do campo SM, no fuso da faixa de horários
+    result_time    TEXT NOT NULL,
+
+    -- ISO local inferido; NULL sem referência de data
+    start_time     TEXT,
+
+    -- NULL quando o SS vem sem placar (SS=#)
+    home_score     INTEGER,
+    away_score     INTEGER,
+    ht_home_score  INTEGER,
+    ht_away_score  INTEGER,
+
+    -- home | draw | away (do Resultado Final)
+    winner         TEXT,
+
+    -- seleções vencedoras, como vieram do normalizer
+    selections     TEXT,
+
+    fixture_id     TEXT REFERENCES games(fixture_id),
+
+    run_id         TEXT NOT NULL,
+    captured_at    TEXT NOT NULL,
+    updated_at     TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_results_match
+    ON results(league_id, start_time);
+
+
+-- ============================================================
 -- VIEWS
 -- ============================================================
 

@@ -950,6 +950,237 @@ def normalize_coupon(
 
 
 # ============================================================
+# RESULTADOS
+# ============================================================
+
+def parse_result_time(
+    sm: str | None,
+):
+    """
+    Campo SM da aba Resultados: horário do
+    jogo em H.MM, no mesmo fuso da faixa de
+    horários ("1.54" -> "01:54").
+    """
+
+    match = re.fullmatch(
+        r"(\d{1,2})\.(\d{2})",
+        sm or "",
+    )
+
+    if not match:
+        return None
+
+    hour, minute = (
+        int(match.group(1)),
+        int(match.group(2)),
+    )
+
+    if hour > 23 or minute > 59:
+        return None
+
+    return f"{hour:02d}:{minute:02d}"
+
+
+def parse_correct_score(
+    name: str | None,
+    home_team: str,
+    away_team: str,
+):
+    """
+    Seleção vencedora de Resultado Correto:
+    "<vencedor> gols_vencedor-gols_perdedor"
+    ("Brighton 2-1", "Empate 1-1"). Retorna
+    (casa, fora); (None, None) quando não há
+    placar ("Qualquer Outro Resultado").
+    """
+
+    match = re.fullmatch(
+        r"(.+?)\s+(\d+)-(\d+)",
+        clean_text(name) or "",
+    )
+
+    if not match:
+        return (None, None)
+
+    team = match.group(1)
+
+    first, second = (
+        int(match.group(2)),
+        int(match.group(3)),
+    )
+
+    if team == home_team or team == "Empate":
+        return (first, second)
+
+    if team == away_team:
+        return (second, first)
+
+    return (None, None)
+
+
+def parse_score(
+    ss: str | None,
+):
+    # SS=2#0 -> (2, 0); SS=# -> (None, None).
+    match = re.fullmatch(
+        r"(\d+)#(\d+)",
+        ss or "",
+    )
+
+    if not match:
+        return (None, None)
+
+    return (
+        int(match.group(1)),
+        int(match.group(2)),
+    )
+
+
+def find_selection(
+    selections,
+    market: str,
+):
+    return next(
+        (
+            selection.get("NA")
+            for selection in selections
+            if selection.get("EX") == market
+        ),
+        None,
+    )
+
+
+def normalize_result(
+    result,
+):
+    fields = result["fields"]
+
+    selections = result.get("selections") or []
+
+    home_team = clean_text(
+        fields.get("N2")
+    )
+
+    away_team = clean_text(
+        fields.get("N3")
+    )
+
+    home_score, away_score = parse_score(
+        fields.get("SS")
+    )
+
+    ht_home_score, ht_away_score = parse_correct_score(
+        find_selection(
+            selections,
+            "Resultado Correto - Intervalo",
+        ),
+        home_team,
+        away_team,
+    )
+
+    # Vencedor vem do Resultado Final, que
+    # existe mesmo quando SS não traz placar.
+    final = clean_text(
+        find_selection(
+            selections,
+            "Resultado Final",
+        )
+    )
+
+    winner = {
+        home_team: "home",
+        away_team: "away",
+        "Empate": "draw",
+    }.get(final)
+
+    return {
+        "league_name": clean_text(
+            fields.get("NA")
+        ),
+        "result_time": parse_result_time(
+            fields.get("SM")
+        ),
+        "home_team": home_team,
+        "away_team": away_team,
+        "home_score": home_score,
+        "away_score": away_score,
+        "ht_home_score": ht_home_score,
+        "ht_away_score": ht_away_score,
+        "winner": winner,
+        "selections": [
+            {
+                "market": clean_text(
+                    selection.get("EX")
+                ),
+                "name": clean_text(
+                    selection.get("NA")
+                ),
+                "odds_fractional": selection.get(
+                    "OD"
+                ),
+                "odds_decimal": selection.get(
+                    "odds_decimal"
+                ),
+            }
+            for selection in selections
+        ],
+    }
+
+
+def normalize_results(
+    parsed_data,
+):
+    source = parsed_data.get(
+        "source",
+        {},
+    )
+
+    league_id = (
+        source.get("pd_tokens") or {}
+    ).get("C")
+
+    if isinstance(league_id, list):
+        league_id = league_id[0]
+
+    results = [
+        normalize_result(
+            result
+        )
+        for result in parsed_data.get(
+            "results",
+            [],
+        )
+    ]
+
+    return {
+        "schema_version": 2,
+        "kind": "results",
+        "source": {
+            "sequence": source.get(
+                "sequence"
+            ),
+            "captured_at": source.get(
+                "captured_at"
+            ),
+            "pd": source.get(
+                "pd"
+            ),
+            # Liga = campo C do pd do results.
+            "league_id": league_id,
+            "body_sha256": source.get(
+                "body_sha256"
+            ),
+        },
+        "summary": {
+            "result_count": len(
+                results
+            ),
+        },
+        "results": results,
+    }
+
+
+# ============================================================
 # FILE
 # ============================================================
 
@@ -960,6 +1191,39 @@ def normalize_file(
     parsed_data = load_json(
         input_file
     )
+
+    if parsed_data.get("kind") == "results":
+
+        normalized = normalize_results(
+            parsed_data
+        )
+
+        save_json(
+            output_file,
+            normalized,
+        )
+
+        print(
+            "\n✓",
+            input_file.name,
+        )
+
+        for result in normalized["results"]:
+
+            print(
+                f"  {result['result_time']} "
+                f"{result['home_team']} "
+                f"{result['home_score']} x "
+                f"{result['away_score']} "
+                f"{result['away_team']}"
+            )
+
+        print(
+            "  Output:",
+            output_file,
+        )
+
+        return
 
     normalized = normalize_coupon(
         parsed_data
@@ -1065,10 +1329,16 @@ def normalize_run(
         exist_ok=True,
     )
 
+    # *_results.json = aba Resultados.
     coupon_files = sorted(
-        run_dir.glob(
-            "*_coupon.json"
-        )
+        [
+            *run_dir.glob(
+                "*_coupon.json"
+            ),
+            *run_dir.glob(
+                "*_results.json"
+            ),
+        ]
     )
 
     if not coupon_files:

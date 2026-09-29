@@ -687,6 +687,155 @@ def parse_coupon(
 
 
 # ============================================================
+# RESULTADOS
+# ============================================================
+
+def parse_results(
+    raw_data,
+):
+    """
+    Corpo de virtualsportscontentapi/results
+    (aba Resultados). Cada jogo encerrado é um
+    MG com N2 (mandante), N3 (visitante),
+    SS (placar "casa#fora"), SM (horário H.MM)
+    e NA (liga), seguido de MA e dos PA com as
+    seleções vencedoras (EX = mercado).
+
+    O MG;ID=MEET de cabeçalho não é jogo, mas
+    continua em records, como todo o resto.
+    """
+
+    body_data = raw_data.get(
+        "body",
+        {},
+    )
+
+    records = parse_protocol(
+        body_data.get(
+            "content",
+            "",
+        )
+    )
+
+    results = []
+
+    unknown_records = []
+
+    current = None
+
+    for record in records:
+
+        record_type = record["type"]
+
+        fields = record["fields"]
+
+        if record_type == "MG" and "N2" in fields:
+
+            current = {
+                "fields": fields,
+                "market": None,
+                "selections": [],
+            }
+
+            results.append(
+                current
+            )
+
+        elif record_type == "MG":
+
+            # Cabeçalho (MEET): encerra o jogo atual.
+            current = None
+
+        elif record_type == "MA" and current:
+
+            current["market"] = fields
+
+        elif record_type == "PA" and current:
+
+            current["selections"].append(
+                {
+                    **fields,
+                    "odds_decimal": fractional_to_decimal(
+                        fields.get(
+                            "OD"
+                        )
+                    ),
+                }
+            )
+
+        elif record_type not in (
+            "F",
+            "CL",
+            "EV",
+        ):
+            unknown_records.append(
+                record
+            )
+
+    request = raw_data.get(
+        "request",
+        {},
+    )
+
+    pd = request.get(
+        "pd"
+    )
+
+    return {
+
+        "schema_version": 1,
+
+        "kind": "results",
+
+        "source": {
+
+            "sequence": raw_data.get(
+                "sequence"
+            ),
+
+            "captured_at": raw_data.get(
+                "captured_at"
+            ),
+
+            "url": request.get(
+                "url"
+            ),
+
+            "pd": pd,
+
+            "pd_tokens": parse_pd(
+                pd
+            ),
+
+            "body_sha256": body_data.get(
+                "sha256"
+            ),
+        },
+
+        "summary": {
+
+            "record_count": len(
+                records
+            ),
+
+            "result_count": len(
+                results
+            ),
+
+            "unknown_record_count": len(
+                unknown_records
+            ),
+        },
+
+        "results": results,
+
+        "unknown_records": unknown_records,
+
+        "records": records,
+    }
+
+
+# ============================================================
 # PROCESSAMENTO DE ARQUIVO
 # ============================================================
 
@@ -698,12 +847,40 @@ def parse_file(
         input_file
     )
 
+    if raw_data.get("type") == "results":
+
+        parsed = parse_results(
+            raw_data
+        )
+
+        save_json(
+            output_file,
+            parsed,
+        )
+
+        print(
+            "\n✓",
+            input_file.name,
+        )
+
+        print(
+            "  Resultados:",
+            parsed["summary"]["result_count"],
+        )
+
+        print(
+            "  Output:",
+            output_file,
+        )
+
+        return True
+
     if raw_data.get("type") != "coupon":
 
         print(
             "Ignorando:",
             input_file.name,
-            "(não é coupon)",
+            "(não é coupon nem results)",
         )
 
         return False
@@ -781,10 +958,16 @@ def parse_run(
         exist_ok=True,
     )
 
+    # *_results.json = aba Resultados.
     coupon_files = sorted(
-        run_dir.glob(
-            "*_coupon.json"
-        )
+        [
+            *run_dir.glob(
+                "*_coupon.json"
+            ),
+            *run_dir.glob(
+                "*_results.json"
+            ),
+        ]
     )
 
     if not coupon_files:
@@ -880,7 +1063,8 @@ def main():
         type=str,
         help=(
             "Processa somente um "
-            "arquivo *_coupon.json"
+            "arquivo *_coupon.json "
+            "ou *_results.json"
         ),
     )
 

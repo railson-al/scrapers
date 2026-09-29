@@ -1,13 +1,28 @@
+"""
+Coleta os jogos (horários) e os resultados de uma liga de Futebol
+Virtual. Com --watch, mantém a página aberta e repete a coleta a
+cada N segundos, processando cada run até o SQLite.
+"""
+
 import argparse
 import asyncio
+import contextlib
+import io
 import json
+import re
+import traceback
 
 from datetime import datetime
 
 from camoufox.async_api import AsyncCamoufox
 
-from config import BASE_URL, RAW_DIR
-from utils import now_iso, normalize_text
+import loader as load_stage
+import normalizer as normalize_stage
+import parser as parse_stage
+
+from config import BASE_URL, RAW_DIR, PARSED_DIR, NORMALIZED_DIR
+from database import connect
+from utils import now_iso, normalize_text, load_json
 from navigation import (
     RawCollector,
     find_virtual_sports_entry,
@@ -17,6 +32,7 @@ from navigation import (
     print_league_cards,
     activate_league_card,
     collect_time_slots,
+    collect_results,
     attach_coupon_files,
 )
 
@@ -138,7 +154,7 @@ async def select_league(
 
 
 # ============================================================
-# MAIN
+# ARGUMENTOS
 # ============================================================
 
 def parse_args():
@@ -159,12 +175,64 @@ def parse_args():
         ),
     )
 
+    parser.add_argument(
+        "--no-results",
+        action="store_true",
+        help="Não clica na aba Resultados.",
+    )
+
+    parser.add_argument(
+        "--watch",
+        type=int,
+        metavar="SEGUNDOS",
+        help=(
+            "Mantém o navegador aberto e repete a "
+            "coleta (Resultados + horários) a cada "
+            "SEGUNDOS, sem recarregar a página. Cada "
+            "ciclo é uma run nova, já processada por "
+            "parser -> normalizer -> loader."
+        ),
+    )
+
+    parser.add_argument(
+        "--click-delay",
+        type=int,
+        default=1000,
+        metavar="MS",
+        help=(
+            "Espera entre os cliques nos horários, "
+            "depois do coupon chegar (padrão: 1000)."
+        ),
+    )
+
+    parser.add_argument(
+        "--cycles",
+        type=int,
+        default=0,
+        help="Com --watch: para após N ciclos (0 = sem limite).",
+    )
+
     return parser.parse_args()
 
 
-async def main():
+# ============================================================
+# RUN
+# ============================================================
 
-    args = parse_args()
+# Falhas seguidas (sem coupon algum) antes de
+# encerrar o --watch; cada falha renavega.
+MAX_WATCH_FAILURES = 3
+
+
+def new_run(
+    args,
+    league: dict | None = None,
+):
+    """
+    Cria data/raw/<run_id>/ e o run.json inicial.
+    league: liga já selecionada (--watch), para
+    os ciclos seguintes não perderem o nome.
+    """
 
     run_id = (
         datetime.now()
@@ -184,48 +252,49 @@ async def main():
     )
 
     print(
-        "\nRUN:"
+        "\nRUN:",
+        run_id,
     )
 
     print(
-        run_id
-    )
-
-    print(
-        "\nOutput:"
-    )
-
-    print(
-        run_dir
+        "Output:",
+        run_dir,
     )
 
     run_metadata = {
-
         "run_id":
             run_id,
-
         "started_at":
             now_iso(),
-
         "base_url":
             BASE_URL,
-
         "collector":
             "bet365-virtual-sports",
-
         "target":
             "football",
-
         "league_requested":
             args.league,
+        "click_delay_ms":
+            args.click_delay,
+        **(league or {}),
     }
 
-    run_file = (
-        run_dir
-        / "run.json"
+    write_run_file(
+        run_dir,
+        run_metadata,
     )
 
-    run_file.write_text(
+    return (
+        run_dir,
+        run_metadata,
+    )
+
+
+def write_run_file(
+    run_dir,
+    run_metadata,
+):
+    (run_dir / "run.json").write_text(
         json.dumps(
             run_metadata,
             ensure_ascii=False,
@@ -234,248 +303,233 @@ async def main():
         encoding="utf-8",
     )
 
-    collector = RawCollector(
-        output_dir=run_dir,
+
+def attach_collector(
+    page,
+    collector,
+):
+    page.on(
+        "request",
+        collector.log_request,
     )
 
-    async with AsyncCamoufox(
-        headless=False,
-    ) as browser:
+    page.on(
+        "response",
+        collector.capture_response,
+    )
 
-        page = (
-            await browser.new_page()
-        )
 
-        page.on(
-            "request",
-            collector.log_request,
-        )
+def detach_collector(
+    page,
+    collector,
+):
+    page.remove_listener(
+        "request",
+        collector.log_request,
+    )
 
-        page.on(
-            "response",
-            collector.capture_response,
-        )
+    page.remove_listener(
+        "response",
+        collector.capture_response,
+    )
 
-        # ====================================================
-        # HOME
-        # ====================================================
 
-        print(
-            "\nAbrindo Bet365..."
-        )
+# ============================================================
+# NAVEGAÇÃO ATÉ A LIGA
+# ============================================================
 
-        await page.goto(
-            BASE_URL,
-            wait_until="domcontentloaded",
-        )
+async def open_league(
+    page,
+    args,
+    run_metadata,
+):
+    """
+    Home -> Esportes Virtuais (B144) -> Futebol
+    (B146) -> liga pedida. Preenche a liga em
+    run_metadata e retorna True em caso de sucesso.
+    """
 
-        print(
-            "Página inicial carregada."
-        )
+    print(
+        "\nAbrindo Bet365..."
+    )
 
-        await page.wait_for_timeout(
-            3000
-        )
+    await page.goto(
+        BASE_URL,
+        wait_until="domcontentloaded",
+    )
 
-        # ====================================================
-        # ENCONTRA ESPORTES VIRTUAIS
-        # ====================================================
+    print(
+        "Página inicial carregada."
+    )
 
-        virtual_sports = (
-            await find_virtual_sports_entry(
-                page=page,
-                timeout_seconds=30,
-            )
-        )
+    await page.wait_for_timeout(
+        3000
+    )
 
-        if virtual_sports is None:
+    # ========================================================
+    # ESPORTES VIRTUAIS (B144)
+    # ========================================================
 
-            print(
-                "\nERRO:"
-                " Esportes Virtuais "
-                "não encontrado."
-            )
+    virtual_sports = await find_virtual_sports_entry(
+        page=page,
+        timeout_seconds=30,
+    )
 
-            return
-
-        print(
-            "\n'Esportes Virtuais' "
-            "encontrado."
-        )
-
-        try:
-
-            html = (
-                await virtual_sports.evaluate(
-                    "(el) => el.outerHTML"
-                )
-            )
-
-            print(
-                "Elemento:"
-            )
-
-            print(
-                html
-            )
-
-        except Exception:
-            pass
-
-        # ====================================================
-        # B144
-        # ====================================================
+    if virtual_sports is None:
 
         print(
-            "\nEntrando em "
-            "Esportes Virtuais..."
+            "\nERRO: Esportes Virtuais não encontrado."
         )
 
-        try:
+        return False
 
-            async with page.expect_response(
+    print(
+        "\nEntrando em Esportes Virtuais..."
+    )
 
-                lambda response:
-                    (
-                        "/virtualsportscontentapi/splash"
-                        in response.url.lower()
+    try:
+        async with page.expect_response(
+            lambda response:
+                (
+                    "/virtualsportscontentapi/splash"
+                    in response.url.lower()
+                    and
+                    "%23avr%23b144%23"
+                    in response.url.lower()
+                ),
+            timeout=30_000,
+        ) as splash_info:
+            await virtual_sports.click()
 
-                        and
+        splash_response = await splash_info.value
 
-                        "%23avr%23b144%23"
-                        in response.url.lower()
-                    ),
-
-                timeout=30_000,
-
-            ) as splash_info:
-
-                await virtual_sports.click()
-
-            splash_response = (
-                await splash_info.value
-            )
-
-        except Exception as exc:
-
-            print(
-                "\nERRO esperando B144:"
-            )
-
-            print(
-                exc
-            )
-
-            return
+    except Exception as exc:
 
         print(
-            "\nVirtual Sports carregado."
+            "\nERRO esperando B144:",
+            exc,
         )
+
+        return False
+
+    print(
+        "\nVirtual Sports carregado. Status:",
+        splash_response.status,
+    )
+
+    # ========================================================
+    # FUTEBOL (B146)
+    # ========================================================
+
+    candidates = await find_football_click_candidates(
+        page=page,
+        timeout_seconds=30,
+    )
+
+    if not candidates:
 
         print(
-            "Status:",
-            splash_response.status,
+            "\nERRO: nenhum candidato de Futebol encontrado."
         )
 
-        # ====================================================
-        # FUTEBOL
-        # ====================================================
+        return False
 
-        candidates = (
-            await find_football_click_candidates(
-                page=page,
-                timeout_seconds=30,
-            )
-        )
+    football_splash, _ = await click_football_and_wait(
+        page=page,
+        candidates=candidates,
+    )
 
-        if not candidates:
-
-            print(
-                "\nNenhum candidato "
-                "de Futebol encontrado."
-            )
-
-            return
-
-        (
-            football_splash,
-            first_coupon,
-        ) = (
-            await click_football_and_wait(
-                page=page,
-                candidates=candidates,
-            )
-        )
-
-        if football_splash is None:
-
-            print(
-                "\nNenhum candidato "
-                "disparou B146."
-            )
-
-            return
-
-        # ====================================================
-        # LIGA
-        # ====================================================
-
-        position, cards = await select_league(
-            page=page,
-            wanted=args.league,
-        )
-
-        run_metadata["available_leagues"] = [
-            card["name"]
-            for card in cards
-        ]
-
-        if position is None:
-            return
-
-        card = cards[position - 1]
-
-        league_name = card["name"]
-
-        run_metadata["league"] = league_name
-
-        run_metadata["league_position"] = position
-
-        if not await activate_league_card(
-            page,
-            card,
-        ):
-            return
-
-        # ====================================================
-        # COLETA
-        # ====================================================
+    if football_splash is None:
 
         print(
-            "\n"
-            + "=" * 100
+            "\nERRO: nenhum candidato disparou B146."
         )
 
-        print(
-            "COLETA DOS HORÁRIOS:",
-            league_name,
-        )
+        return False
 
-        print(
-            "=" * 100
-        )
+    # ========================================================
+    # LIGA
+    # ========================================================
 
-        slots = await collect_time_slots(
+    position, cards = await select_league(
+        page=page,
+        wanted=args.league,
+    )
+
+    run_metadata["available_leagues"] = [
+        card["name"]
+        for card in cards
+    ]
+
+    if position is None:
+        return False
+
+    card = cards[position - 1]
+
+    run_metadata["league"] = card["name"]
+    run_metadata["league_position"] = position
+
+    return await activate_league_card(
+        page,
+        card,
+    )
+
+
+# ============================================================
+# COLETA DE UM CICLO
+# ============================================================
+
+async def collect_league(
+    page,
+    collector,
+    args,
+    run_metadata,
+):
+    print(
+        "\n"
+        + "=" * 100
+    )
+
+    print(
+        "COLETA:",
+        run_metadata.get("league"),
+    )
+
+    print(
+        "=" * 100
+    )
+
+    # Resultados antes dos horários: a aba
+    # mostra só 2 jogos por vez e a janela
+    # é curta; os jogos futuros continuam
+    # na faixa por vários minutos.
+    if not args.no_results:
+        run_metadata["results"] = await collect_results(
             page=page,
             collector=collector,
         )
 
-        # Dá tempo aos handlers de response
-        # terminarem de gravar os arquivos.
-        await page.wait_for_timeout(
-            2000
-        )
+    slots = await collect_time_slots(
+        page=page,
+        collector=collector,
+        click_delay_ms=args.click_delay,
+    )
 
+    # Dá tempo aos handlers de response
+    # terminarem de gravar os arquivos.
+    await page.wait_for_timeout(
+        2000
+    )
+
+    return slots
+
+
+def finish_run(
+    run_dir,
+    run_metadata,
+    slots,
+    collector,
+):
     attach_coupon_files(
         slots,
         collector.coupons,
@@ -489,7 +543,7 @@ async def main():
             for slot in slots
             if slot["league_id"]
         ),
-        None,
+        run_metadata.get("league_id"),
     )
 
     run_metadata["time_slots"] = slots
@@ -518,7 +572,7 @@ async def main():
 
     print(
         "RESUMO:",
-        league_name,
+        run_metadata.get("league"),
         f"(C={run_metadata['league_id']})",
     )
 
@@ -554,17 +608,370 @@ async def main():
             unlinked,
         )
 
-    run_metadata[
-        "finished_at"
-    ] = now_iso()
+    run_metadata["finished_at"] = now_iso()
 
-    run_file.write_text(
-        json.dumps(
+    write_run_file(
+        run_dir,
+        run_metadata,
+    )
+
+
+# ============================================================
+# PIPELINE (--watch)
+# ============================================================
+
+def process_run(
+    run_dir,
+    league_id: str | None,
+):
+    """
+    parser -> normalizer -> loader na run recém
+    fechada, no mesmo processo. A saída detalhada
+    dos estágios é suprimida; imprime um resumo.
+    Uma falha aqui não interrompe o --watch.
+    """
+
+    run_id = run_dir.name
+
+    output = io.StringIO()
+
+    try:
+
+        with contextlib.redirect_stdout(output):
+
+            parse_stage.parse_run(
+                run_dir
+            )
+
+            normalize_stage.normalize_run(
+                PARSED_DIR / run_id
+            )
+
+            conn = connect()
+
+            try:
+                load_stage.load_run(
+                    conn,
+                    NORMALIZED_DIR / run_id,
+                )
+
+            finally:
+                conn.close()
+
+    except Exception:
+
+        print(
+            "\nERRO no pipeline da run",
+            run_id,
+        )
+
+        traceback.print_exc()
+
+        return
+
+    applied = re.findall(
+        r"Placares aplicados: (\d+)",
+        output.getvalue(),
+    )
+
+    shown = []
+
+    for results_file in sorted(
+        (NORMALIZED_DIR / run_id).glob(
+            "*_results.json"
+        )
+    ):
+        shown += [
+            result["result_time"] or "?"
+            for result in load_json(
+                results_file
+            ).get("results") or []
+        ]
+
+    conn = connect()
+
+    try:
+        counts = conn.execute(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM games WHERE league_id = :league),
+                (SELECT COUNT(*) FROM results WHERE league_id = :league),
+                (SELECT COUNT(home_score) FROM games WHERE league_id = :league)
+            """,
+            {
+                "league": league_id,
+            },
+        ).fetchone()
+
+    finally:
+        conn.close()
+
+    print(
+        f"\n[pipeline] run={run_id} "
+        f"aba Resultados={','.join(shown) or '-'} "
+        f"placares aplicados={applied[-1] if applied else 0} "
+        f"| liga {league_id}: jogos={counts[0]} "
+        f"resultados={counts[1]} com placar={counts[2]}"
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+async def watch(
+    page,
+    args,
+    collector,
+    run_dir,
+    run_metadata,
+):
+    """
+    Repete a coleta na mesma página a cada
+    args.watch segundos. Cada ciclo fecha a
+    própria run. Ciclo sem coupon algum conta
+    como falha e renavega a partir da home.
+    """
+
+    loop = asyncio.get_running_loop()
+
+    cycle = 1
+
+    failures = 0
+
+    # Liga fixa entre ciclos; league_id só
+    # é conhecido depois do 1º ciclo.
+    league_keys = (
+        "league",
+        "league_position",
+        "available_leagues",
+    )
+
+    while True:
+
+        started = loop.time()
+
+        print(
+            f"\n[watch] ciclo {cycle}"
+            + (f"/{args.cycles}" if args.cycles else "")
+        )
+
+        slots = []
+
+        try:
+            slots = await collect_league(
+                page,
+                collector,
+                args,
+                run_metadata,
+            )
+
+        except Exception as exc:
+
+            print(
+                "\nERRO no ciclo:",
+                exc,
+            )
+
+        finish_run(
+            run_dir,
             run_metadata,
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
+            slots,
+            collector,
+        )
+
+        filled = sum(
+            1
+            for slot in slots
+            if slot.get("file")
+            and not slot.get("empty")
+        )
+
+        print(
+            f"\n[watch] ciclo {cycle}: horários com dados "
+            f"{filled}/{len(slots)} "
+            f"(clique a cada {args.click_delay} ms)"
+        )
+
+        process_run(
+            run_dir,
+            run_metadata.get("league_id"),
+        )
+
+        if any(
+            slot.get("file")
+            for slot in slots
+        ):
+            failures = 0
+
+        else:
+            failures += 1
+
+            print(
+                f"\n[watch] ciclo sem coupons "
+                f"({failures}/{MAX_WATCH_FAILURES})"
+            )
+
+        if failures >= MAX_WATCH_FAILURES:
+
+            print(
+                "\n[watch] falhas seguidas demais, encerrando."
+            )
+
+            return
+
+        if args.cycles and cycle >= args.cycles:
+
+            print(
+                "\n[watch] ciclos concluídos."
+            )
+
+            return
+
+        wait = args.watch - (
+            loop.time() - started
+        )
+
+        if page.is_closed():
+
+            print(
+                "\n[watch] navegador/página fechado, encerrando."
+            )
+
+            return
+
+        if wait > 0:
+
+            try:
+                await page.wait_for_timeout(
+                    wait * 1000
+                )
+
+            except Exception as exc:
+
+                # Ex.: janela fechada durante a espera.
+                print(
+                    "\n[watch] página indisponível, encerrando:",
+                    exc,
+                )
+
+                return
+
+        cycle += 1
+
+        # Run nova para o próximo ciclo.
+        detach_collector(
+            page,
+            collector,
+        )
+
+        run_dir, run_metadata = new_run(
+            args,
+            {
+                **{
+                    key: run_metadata.get(key)
+                    for key in league_keys
+                },
+                "league_id": run_metadata.get(
+                    "league_id"
+                ),
+            },
+        )
+
+        collector = RawCollector(
+            output_dir=run_dir,
+        )
+
+        attach_collector(
+            page,
+            collector,
+        )
+
+        if failures:
+
+            print(
+                "\n[watch] renavegando a partir da home..."
+            )
+
+            try:
+                await open_league(
+                    page,
+                    args,
+                    run_metadata,
+                )
+
+            except Exception as exc:
+
+                print(
+                    "\nERRO renavegando:",
+                    exc,
+                )
+
+
+async def main():
+
+    args = parse_args()
+
+    run_dir, run_metadata = new_run(
+        args
+    )
+
+    collector = RawCollector(
+        output_dir=run_dir,
+    )
+
+    async with AsyncCamoufox(
+        headless=False,
+    ) as browser:
+
+        page = await browser.new_page()
+
+        attach_collector(
+            page,
+            collector,
+        )
+
+        if not await open_league(
+            page,
+            args,
+            run_metadata,
+        ):
+
+            run_metadata["finished_at"] = now_iso()
+
+            run_metadata["error"] = "navigation failed"
+
+            write_run_file(
+                run_dir,
+                run_metadata,
+            )
+
+            return
+
+        if args.watch:
+
+            await watch(
+                page,
+                args,
+                collector,
+                run_dir,
+                run_metadata,
+            )
+
+            return
+
+        slots = await collect_league(
+            page,
+            collector,
+            args,
+            run_metadata,
+        )
+
+    finish_run(
+        run_dir,
+        run_metadata,
+        slots,
+        collector,
     )
 
     print(
@@ -577,7 +984,6 @@ async def main():
 # ============================================================
 
 if __name__ == "__main__":
-
     asyncio.run(
         main()
     )
