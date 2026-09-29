@@ -19,6 +19,12 @@ O navegador ([Camoufox](https://camoufox.com/), um Firefox anti-detecção contr
       │
       ▼
  normalizer.py  ──►  data/normalized/<run_id>/NNNN_coupon.json  (schema v2)
+      │
+      ▼
+ loader.py      ──►  data/db/bet365.sqlite                     (SQLite)
+      │
+      ▼
+ dashboard.py   ──►  Streamlit (grid de jogos + detalhes)
 ```
 
 `<run_id>` é o timestamp da execução (`YYYYMMDD_HHMMSS`).
@@ -34,13 +40,18 @@ O navegador ([Camoufox](https://camoufox.com/), um Firefox anti-detecção contr
 │   │   ├── collector_all.py # 1. coleta bruta de todas as ligas
 │   │   ├── parser.py       # 2. tokeniza o protocolo e monta a hierarquia
 │   │   ├── normalizer.py   # 3. achata para eventos → mercados → seleções
+│   │   ├── loader.py       # 4. grava o normalized no SQLite
+│   │   ├── schema.sql      # schema do banco (leagues, games, markets, selections + views)
+│   │   ├── database.py     # conexão SQLite e upserts, compartilhado
+│   │   ├── dashboard.py    # 5. dashboard Streamlit sobre o SQLite
+│   │   ├── dashboard_queries.py # consultas de leitura do dashboard
 │   │   ├── config.py       # constantes compartilhadas (URL, diretórios de data/)
 │   │   ├── utils.py        # helpers puros compartilhados (datas, pd, JSON, URLs)
 │   │   ├── navigation.py   # RawCollector + navegação no site, usados pelos coletores
 │   │   └── tests/
 │   │       ├── test_leagues.py # diagnóstico: percorre as ligas e registra o tráfego
 │   │       └── test_times.py   # diagnóstico: percorre os horários e registra o tráfego
-│   └── scrapers/           # pacote do entrypoint `scrapers` (ainda placeholder)
+├── tests/                  # testes pytest (uv run pytest)
 └── data/                   # saídas (ignorado pelo git)
 ```
 
@@ -141,6 +152,44 @@ Exemplo (resumido):
   }]
 }
 ```
+
+### 4. Loader (SQLite)
+
+```bash
+uv run python src/365-fv/loader.py                    # última execução em data/normalized/
+uv run python src/365-fv/loader.py --run 20260927_113032
+uv run python src/365-fv/loader.py --file data/normalized/20260927_113032/0003_coupon.json
+```
+
+Grava em `data/db/bet365.sqlite`, usando o schema de `src/365-fv/schema.sql` (aplicado automaticamente a cada conexão):
+
+- `leagues` (`league_id`, `name`): o nome vem do `run.json` da captura crua, casado pelo nome do arquivo. Sem ele, o id sai do código `M` do `pd`.
+- `games`: um jogo por `fixture_id`, com mandante/visitante, `league_id`, `start_time`, `home_score`/`away_score` (NULL por enquanto, porque a coleta ainda não pega resultados) e a última `run_id`.
+- `markets`: mercados do jogo, identificados por `(fixture_id, position)`. O `market_id` do protocolo identifica o grupo e se repete entre colunas como "Mais de"/"Menos de".
+- `selections`: seleções com `odds_fractional` e `odds_decimal`.
+- Views `games_view` (confronto, liga, data, hora, placar) e `odds_view` (odds achatadas com o jogo).
+
+A carga é idempotente: recarregar uma run atualiza o jogo e troca as odds pelo snapshot mais recente, sem apagar o placar.
+
+```bash
+sqlite3 data/db/bet365.sqlite "SELECT confronto, liga, data, hora, placar FROM games_view LIMIT 5;"
+```
+
+### 5. Dashboard (Streamlit)
+
+```bash
+uv run streamlit run src/365-fv/dashboard.py
+```
+
+Lê `data/db/bet365.sqlite` em modo somente leitura (rode o loader antes). A barra lateral filtra por liga (pelo nome, porque a mesma liga aparece com mais de um `league_id`). O grid lista os jogos do mais recente para o mais antigo, e selecionar uma linha mostra os detalhes do jogo e as odds agrupadas por grupo de mercado, na ordem do coupon.
+
+### Testes
+
+```bash
+uv run pytest
+```
+
+Os testes ficam em `tests/` na raiz e usam um SQLite temporário. Os `test_*.py` de `src/365-fv/tests/` não são testes pytest (veja abaixo).
 
 ### Scripts de diagnóstico
 

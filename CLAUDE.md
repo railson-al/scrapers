@@ -18,11 +18,14 @@ uv run python src/365-fv/collector.py [--league <name|N>]  # 1. collect every ga
 uv run python src/365-fv/collector_all.py                  # 1. (alt) every game of every league, same output format
 uv run python src/365-fv/parser.py             # 2. raw -> data/parsed/<run_id>/     (schema v1)
 uv run python src/365-fv/normalizer.py         # 3. parsed -> data/normalized/<run_id>/ (schema v2)
+uv run python src/365-fv/loader.py             # 4. normalized -> data/db/bet365.sqlite (SQLite)
+uv run streamlit run src/365-fv/dashboard.py   # 5. dashboard (grid de jogos por liga + detalhes), lê o SQLite read-only
+uv run pytest                                  # testes em tests/ (raiz)
 ```
 
-`parser.py` and `normalizer.py` default to the latest run and accept `--run <run_id>` or `--file <path>` to process one run or a single file — use `--file` for fast iteration against an existing capture. `<run_id>` is `YYYYMMDD_HHMMSS`.
+`parser.py`, `normalizer.py` and `loader.py` default to the latest run and accept `--run <run_id>` or `--file <path>` to process one run or a single file — use `--file` for fast iteration against an existing capture. `<run_id>` is `YYYYMMDD_HHMMSS`.
 
-There is no test suite, linter, or formatter configured. `tests/test_leagues.py` and `tests/test_times.py` are **not pytest tests**: they are browser-driven diagnostic scripts that click each league / each time slot and log the network traffic each click triggers, writing to `data/diagnostics/<run_id>/`. Run them like the other scripts.
+pytest runs only the root `tests/` (configured via `[tool.pytest.ini_options]` in `pyproject.toml`, with `src/365-fv` on `pythonpath`); no linter or formatter is configured. `src/365-fv/tests/test_leagues.py` and `src/365-fv/tests/test_times.py` are **not pytest tests**: they are browser-driven diagnostic scripts that click each league / each time slot and log the network traffic each click triggers, writing to `data/diagnostics/<run_id>/`. Run them like the other scripts.
 
 Anything that opens the browser (`collector*.py`, `test_*.py`) runs with `headless=False` and needs a graphical environment plus live access to the site — you generally cannot run these yourself; the parser/normalizer can be run offline against existing `data/` captures.
 
@@ -35,8 +38,10 @@ Anything that opens the browser (`collector*.py`, `test_*.py`) runs with `headle
 - **Never drop unknown data in the parser.** Many protocol fields are still unconfirmed, so unrecognized records go to `unknown_records` and all tokenized `records` are kept in the output for inspection. The normalizer is where data is flattened and auxiliary odds-less records are discarded.
 - In the normalizer, some market groups label selections by position rather than by ID; these are listed in `POSITIONAL_LABEL_GROUPS` (matched by exact Portuguese group name). Groups without an ID get a synthetic stable `group_key`.
 - **Navigation:** the collector confirms progress via splash `pd` codes — `#AVR#B144#` = Virtual Sports, `B146` = Virtual Football. DOM targets are found by heuristic candidate scoring (`score_ancestor` / `ancestor_locator` in `collector.py`), not fixed selectors, and are fragile to layout changes.
+- **Database:** `schema.sql` (DDL, applied on every `database.connect()`) + `database.py` (upserts). Tables `leagues` → `games` (PK `fixture_id`) → `markets` (surrogate `id`, unique `(fixture_id, position)` — the protocol `market_id` is per *group* and repeats across columns like Mais de/Menos de) → `selections`. League name comes from the raw `run.json` (matched by coupon file name), not from the normalized output. `upsert_game` never touches `home_score`/`away_score` (NULL until a results collector exists; use `set_score`). Loading is idempotent: markets/selections are replaced by the latest snapshot.
 - Raw captures store cookies only as names + SHA-256 hashes; keep it that way.
-- `src/scrapers/` (the `scrapers` entrypoint in `pyproject.toml`) is still a placeholder; `python-dotenv` is a dependency but unused.
+- **Dashboard:** `dashboard.py` (Streamlit UI) + `dashboard_queries.py` (pure read queries, tested). It opens the DB read-only (`mode=ro`) instead of `database.connect()`, which runs DDL. Leagues are filtered by *name*, since one name maps to several `league_id`s.
+- `[tool.uv] package = false`: the repo is scripts only (`src/scrapers/` and its `scrapers` entrypoint were removed); `python-dotenv` is a dependency but unused.
 
 ## Conventions
 

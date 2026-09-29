@@ -31,3 +31,12 @@ PARSED_DIR = DATA_DIR / "parsed"
 NORMALIZED_DIR = DATA_DIR / "normalized"
 
 DIAGNOSTICS_DIR = DATA_DIR / "diagnostics"
+
+
+# ============================================================
+# DATABASE (SQLite em dev)
+# ============================================================
+
+DB_DIR = DATA_DIR / "db"
+
+DB_PATH = DB_DIR / "bet365.sqlite"
